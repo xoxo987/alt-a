@@ -103,10 +103,17 @@ static void glibc_srand(u32 s){
   GI=344;
 }
 static u32 r_glibc(void){ GR[GI]=GR[GI-31]+GR[GI-3]; return GR[GI++]>>1; }
-static u32 dr_rand(void){ return !strcmp(RANDIMPL,"glibc")?r_glibc():r_bsd(); }
+// Darwin/macOS libSystem rand(): Park-Miller minimal standard x=16807*x mod (2^31-1),
+// seed 0 mapped to 123459876. Verified against this Mac's own rand() for seeds 0,1,2,3,42.
+static u32 RD;
+static void darwin_srand(u32 s){ RD = s ? s : 123459876u; }
+static u32 r_darwin(void){ RD = (u32)(((u64)RD*16807u) % 2147483647ULL); return RD; }
+static u32 dr_rand(void){ if(!strcmp(RANDIMPL,"glibc")) return r_glibc(); if(!strcmp(RANDIMPL,"darwin")) return r_darwin(); return r_bsd(); }
 static u32 random32(void){ return (dr_rand()&0xff)|((dr_rand()&0xff)<<8)|((dr_rand()&0xff)<<16)|((dr_rand()&0xff)<<24); }
 static void mob_bytes(u32 t,u8*out,int n){
-  if(!strcmp(RANDIMPL,"glibc")) glibc_srand(t); else dr_srand(t);
+  if(!strcmp(RANDIMPL,"glibc")) glibc_srand(t);
+  else if(!strcmp(RANDIMPL,"darwin")) darwin_srand(t);
+  else dr_srand(t);
   u32 r=0;
   for(int i=0;i<n;i++){ if(i%4==0) r=random32(); out[i]=(u8)((r>>((i%4)*8))&0xff); }
 }
@@ -192,17 +199,18 @@ static int priv_pub33(const u8*priv,u8*out33){
   return secp256k1_ec_pubkey_serialize(CTX,out33,&L,&pk,SECP256K1_EC_COMPRESSED)==1;
 }
 
-// entropy -> mnemonic -> pbkdf2 -> bip44.  variant v: 0=bsd/12w 1=glibc/12w 2=bsd/24w 3=glibc/24w
-static int NCOMB=4;
+// entropy -> mnemonic -> pbkdf2 -> bip44.  v = 0..NIMPL-1 impl of 12 words, then 24 words
+static const char* IMPLS[3]={"darwin","ansi","glibc"};
+static int NIMPL=1, NCOMB=2;
 static void derive_one(u32 t,int v,u8*out20){
-  int nw = (v>=2)?32:16;
-  RANDIMPL = (v&1)?"glibc":"bsd";
+  int nw = (v>=NIMPL)?32:16;
+  RANDIMPL = IMPLS[v%NIMPL];
   u8 ent[32]; char mn[400]; u8 s64[64]; u8 k[32];
   mob_bytes(t,ent,nw); to_mnemonic(ent,nw,mn,sizeof mn);
   PKCS5_PBKDF2_HMAC(mn,(int)strlen(mn),(const u8*)"mnemonic",8,2048,EVP_sha512(),64,s64);
   bip32_priv(s64,k,0); priv_to_addr(k,out20);
 }
-static void seed_to_addrs(u32 t,u8 a[4][20]){
+static void seed_to_addrs(u32 t,u8 a[6][20]){
   for(int v=0;v<NCOMB;v++) derive_one(t,v,a[v]);
 }
 
@@ -282,7 +290,7 @@ static int prove(void){
 }
 
 static int bench(long N){
-  u8 a[4][20]; double t0=now();
+  u8 a[6][20]; double t0=now();
   for(long i=0;i<N;i++){ seed_to_addrs((u32)i,a); if(a[3][0]==0xff) a[0][0]^=a[3][0]; }
   double dt=now()-t0;
   printf("bench: %ld timestamps in %.3fs = %.2f keys/s/core (%.1f us/op) acc=%02x\n",N,dt,N*NCOMB/dt,1e6*dt/N,a[0][0]);
@@ -298,13 +306,13 @@ static void cur_write(const char*cur,int tid,u64 v){
 }
 static void* worker(void*arg){
   Job*j=(Job*)arg;
-  u8 a[4][20];
+  u8 a[6][20];
   for(u64 s=j->lo;s<j->hi;s++){
     seed_to_addrs((u32)s,a);
     for(int v=0;v<NCOMB;v++){
       if(oracle_has(a[v])){
         char ah[41]; hex(a[v],20,ah);
-        const char*rn=(v&1)?"glibc":"bsd"; int nw=(v>=2)?24:12;
+        const char*rn=IMPLS[v%NIMPL]; int nw=(v>=NIMPL)?24:12;
         printf("HIT t=%u rand=%s words=%d addr=0x%s\n",(u32)s,rn,nw,ah); fflush(stdout);
         if(j->hits){ FILE*h=fopen(j->hits,"a"); if(h){ fprintf(h,"%u\t%s\t%d\t0x%s\n",(u32)s,rn,nw,ah); fclose(h);} }
         __sync_fetch_and_add(&G_HITS,1);
@@ -324,8 +332,16 @@ static void* worker(void*arg){
 static int range(u64 lo,u64 hi,const char*cur,const char*hits,const char*oracle,int nthr){
   const char*vic=getenv("TW_VICTIMS");
   if(vic && *vic) oracle_load_txt(vic); else oracle_load(oracle);
+  const char*rsel=getenv("TW_RANDS");
+  if(rsel && *rsel && strcmp(rsel,"all")){
+    if(!strcmp(rsel,"darwin")){ static const char*d[1]={"darwin"}; memcpy(IMPLS,d,sizeof d); NIMPL=1; }
+    else if(!strcmp(rsel,"ansi")){ static const char*x[1]={"ansi"}; memcpy(IMPLS,x,sizeof x); NIMPL=1; }
+    else if(!strcmp(rsel,"glibc")){ static const char*g[1]={"glibc"}; memcpy(IMPLS,g,sizeof g); NIMPL=1; }
+  } else NIMPL=3;
   const char*nwenv=getenv("TW_NWORDS");
-  NCOMB = (nwenv && *nwenv && !strcmp(nwenv,"12"))?2:((nwenv && *nwenv && !strcmp(nwenv,"24"))?2:4);
+  if(nwenv && *nwenv && !strcmp(nwenv,"12")) NCOMB=NIMPL;
+  else if(nwenv && *nwenv && !strcmp(nwenv,"24")){ static const char*w[3]={"darwin","ansi","glibc"}; if(NIMPL==3) memcpy(IMPLS,w,sizeof w); NCOMB=NIMPL; }
+  else NCOMB=2*NIMPL;
   if(cur){ u64 mn=~0ULL; int any=0;
     for(int t=0;t<nthr;t++){ char f[512]; snprintf(f,sizeof f,"%s.%d",cur,t); FILE*fp=fopen(f,"r"); if(fp){ u64 c=0; if(fscanf(fp,"%llu",&c)==1){ if(!any||c<mn) mn=c; any=1; } fclose(fp);} }
     if(any&&mn>lo&&mn<hi) lo=mn;
@@ -359,7 +375,8 @@ int main(int argc,char**argv){
   if(!strcmp(argv[1],"--seed")){
     u32 s=(u32)strtoul(argv[2],0,0);
     u8 ent[16]; tw_bytes(s,ent,16); char mn[256]; to_mnemonic(ent,16,mn,sizeof mn);
-    u8 a[4][20]; seed_to_addrs(s,a); for(int v=0;v<NCOMB;v++){ char h2[41]; hex(a[v],20,h2); printf("t=%u %s/%dw=0x%s\n",s,(v&1)?"glibc":"bsd",(v>=2)?24:12,h2); }
+    NIMPL=3; NCOMB=6; u8 a[6][20]; seed_to_addrs(s,a);
+    for(int v=0;v<NCOMB;v++){ char h2[41]; hex(a[v],20,h2); printf("t=%u %s/%dw=0x%s\n",s,IMPLS[v%NIMPL],(v>=NIMPL)?24:12,h2); }
     return 0;
   }
   return 2;
