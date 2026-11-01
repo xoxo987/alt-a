@@ -1,0 +1,24 @@
+name: twcash-stage2
+on: workflow_dispatch
+concurrency:
+  group: twmt-cash
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      max-parallel: 4
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get -qq update && sudo apt-get -qq install -y libsecp256k1-dev libssl-dev
+      - run: bash run2.sh ${{ matrix.shard }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chits-${{ matrix.shard }}
+          path: hits2.${{ matrix.shard }}.tsv
+          if-no-files-found: ignore
+          retention-days: 14
