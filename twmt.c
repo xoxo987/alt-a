@@ -266,7 +266,7 @@ static void* worker(void*arg){
     u64 d=++j->done;
     if((d&0xFFFFF)==0){
       double dt=now()-j->t0;
-      fprintf(stderr,"t%llu %.1f k/s\n",(unsigned long long)j->tid,d/dt/1e3);
+      fprintf(stderr,"t%llu %.1f k/s\n",(unsigned long long)j->tid,d/dt/1e3); fflush(stderr);
       cur_write(j->cur,j->tid,s+1);
     }
   }
