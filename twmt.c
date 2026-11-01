@@ -83,9 +83,10 @@ static void bx_bytes(u32 seed,u8*out,int n){ mt_seed(seed); for(int i=0;i<n;i++)
 // ---------------- BIP39 ----------------
 static const char* WL[2048];
 static void load_words(void){
-  const char* paths[]={"db/bip39.txt","conf/bip39.txt","../db/bip39.txt"};
+  const char* env=getenv("TW_WORDS");
+  const char* paths[]={env, "words.txt", "db/bip39.txt", "conf/bip39.txt", "../db/bip39.txt"};
   FILE*f=NULL;
-  for(int i=0;i<3;i++){ f=fopen(paths[i],"r"); if(f) break; }
+  for(int i=0;i<5;i++){ if(!paths[i]) continue; f=fopen(paths[i],"r"); if(f) break; }
   if(!f){ fprintf(stderr,"no bip39.txt\n"); exit(2); }
   static char store[2048][16]; int n=0;
   char line[64];
